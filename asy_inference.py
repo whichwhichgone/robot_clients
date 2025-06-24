@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 import draccus
 import requests
 from scipy.spatial.transform import Rotation as R
-
+import threading
+from collections import deque
+from numpy import dot, average, linalg
 
 ### Add path for the required packages
 sys.path.append("/home/robot/UR_Robot_Arm_Show/tele_ws/src/tele_ctrl_jeff/scripts")
@@ -26,8 +28,8 @@ from arm_robot import ArmRobot
 
 @dataclass
 class InferConfig:
-    server_url: str = "http://172.16.78.10:35189/predict"
-    debug_mode: bool = True
+    server_url: str = "http://172.16.78.10:35001/predict"
+    debug_mode: bool = False
     debug_dir: str = Path("/home/robot/workspace/ManiStation/UR5_cogact/imgs_debug")
 
     # initial absolute position
@@ -46,8 +48,68 @@ class InferConfig:
     )
 
     # language instructions
-    language_instructions = ["grasp and lift the corn",]
+    language_instructions = ["pick up the cron and put it into the blue bowl",]
 
+class QueueEmpty(Exception):
+    """Exception raised when attempting to access an empty buffer."""
+    pass
+
+class AsynchronousBuffer:
+    def __init__(self, maxsize=16):
+        assert maxsize > 0, "maxsize must be greater than 0"
+        self.maxsize = maxsize
+        self._queue = deque()
+        self._lock = threading.Lock()
+    
+    def put(self, item):
+        with self._lock:
+            if self.maxsize > 0 and len(self._queue) >= self.maxsize:
+                self._queue.popleft()
+            self._queue.append(item)
+    
+    def get(self):
+        with self._lock:
+            if len(self._queue) == 0:
+                raise QueueEmpty("Queue is empty")
+            return self._queue.popleft()
+    
+    def peek(self):
+        # return the latest item in the queue without removing it
+        with self._lock:
+            if len(self._queue) == 0:
+                raise QueueEmpty("Queue is empty")
+            return self._queue[-1]
+    def get_last_n(self, n):
+        with self._lock:
+            if len(self._queue) < n:
+                raise ValueError(f"Queue has less than {n} elements")
+            return list(self._queue)[-n:]
+    def size(self):
+        with self._lock:
+            return len(self._queue)
+
+    def empty(self):
+        with self._lock:
+            return len(self._queue) == 0
+    def clear(self):
+        with self._lock:
+            self._queue.clear()
+    def max(self, key=None):
+        """
+        Return the maximum item in the buffer.
+        
+        Parameters
+        ----------
+        key : optional function to extract comparison key from items, like in Python's max()
+
+        Returns
+        -------
+        The maximum item in the queue.
+        """
+        with self._lock:
+            if not self._queue:
+                return 0
+            return max(self._queue, key=key)
 
 class ClientRobot:
 
@@ -61,6 +123,15 @@ class ClientRobot:
         self.debug = cfg.debug_mode
         self.debug_dir = cfg.debug_dir
         self.init_action = cfg.init_action
+        self.action_buffer = AsynchronousBuffer(maxsize=16)
+        self.env_obs_buffer = AsynchronousBuffer(maxsize=10)
+        self.pre_action_buffer = AsynchronousBuffer(maxsize=5)
+        self.thread_get_action_loop = threading.Thread(target=self.get_action_loop)
+        self.thread_running = False
+        self.instruction = None
+        self.s_min = 5
+        self.t = 0
+        self.s = 0
 
     def env_update(self):
         scene_image: np.ndarray = self.scene_image_subscriber.get_current_image()
@@ -88,18 +159,85 @@ class ClientRobot:
             depth_img.save(self.debug_dir / "raw_depth.png")
         return env_obs
 
+    def state_similarity(self, obs):
+        # Check if the action buffer is empty or not
+        if self.env_obs_buffer.empty():
+            return True
+        else:
+            # 获取当前观测状态
+            obs_state = obs['state']
+            last_obs = self.env_obs_buffer.peek()
+            last_obs_state = last_obs['state']
+
+            def cosine_similarity(state1, state2):
+                """Calculate cosine similarity between two vectors."""
+                if linalg.norm(state1) == 0 or linalg.norm(state2) == 0:
+                    return 0.0
+                return np.dot(state1, state2) / (np.linalg.norm(state1) * np.linalg.norm(state2))
+            
+            # 计算余弦相似度
+            res = cosine_similarity(obs_state, last_obs_state)
+            return res < 0.9
+    
+    def get_action_loop(self):
+        g = 7
+        while True:
+            if  self.t >= self.s_min or self.action_buffer.empty():
+                self.s = self.t
+                print("Now get the actions")
+                env_obs = self.env_update()
+                env_obs = self.get_input_obs(env_obs)
+                # 对新的观测状态与旧的进行欧式距离比较
+                if_need_process = self.state_similarity(env_obs)
+                self.env_obs_buffer.put(env_obs)
+                if not if_need_process:
+                    print("State is similar, skip this step")
+                    time.sleep(0.1)
+                    continue
+                # 得到推理前buffer的大小
+                index_1 = self.action_buffer.size()
+                start = time.time()
+                # 若buffer为空，则初始化
+                if self.action_buffer.empty():
+                    action = self.step(env_obs, self.instruction)
+                else:
+                    d = self.pre_action_buffer.get()
+                    action = self.step(env_obs, self.instruction, d)
+                end = time.time()
+                # print("Time: ", end - start)
+                if self.action_buffer.empty():
+                    for step_action in action:
+                        self.action_buffer.put(step_action)
+                else:
+                    # 得到推理后buffer的大小
+                    index_2 = self.action_buffer.size()
+                    print("Buffer size: ", index_2)
+                    self.action_buffer.clear()
+                    index_diff = index_1 - index_2
+                    print("Delay size: ", index_diff)
+                    # 存储推理延迟
+                    self.pre_action_buffer.put(index_diff)
+                    # 更新buffer
+                    for step_action in action[index_diff:]:
+                        self.action_buffer.put(step_action)
+                    self.t = self.t -self.s
+            else:
+                time.sleep(0.1)
+
     def reset(self):
         self.robot.init_action(self.init_action)
 
-    def step(self, obs, language_instruction):
+    def step(self, obs, language_instruction, d = 7):
         img_scene = obs["img_scene"]
         img_hand_left = obs["img_hand_left"]
         img_hand_right = obs["img_hand_right"]
+        depth = obs["depth"]
 
         # convert to bytes for sending
         img_scene_data = img_scene.tobytes()
         img_hand_left_data = img_hand_left.tobytes()
         img_hand_right_data = img_hand_right.tobytes()
+        depth_data = depth.astype(np.float32).tobytes()
 
         if self.debug:
             img_scene = Image.fromarray(img_scene)
@@ -113,11 +251,14 @@ class ClientRobot:
         # self.robot.get_state()
         state = self.robot.get_state()
         payload = {"instruction": language_instruction, "state": state.tolist()}
+        d = np.array([d], dtype=np.float32).tobytes()
         files = {
             "json": json.dumps(payload),
             "img_scene": ("img_scene.txt", img_scene_data, "text/plain"),
             "img_hand_left": ("img_hand_left.txt", img_hand_left_data, "text/plain"),
             "img_hand_right": ("img_hand_right.txt", img_hand_right_data, "text/plain"),
+            "depth": ("depth.txt", depth_data, "text/plain"),
+            "delay": ("delay.txt", d, "text/plain"),
         }
 
         timeout_cnt = 0
@@ -132,7 +273,7 @@ class ClientRobot:
                     print("Error return code, retry")
             except requests.RequestException:
                 print("Error request sending, retry")
-            time.sleep(0.5)
+            #time.sleep(0.5)
             timeout_cnt += 1
             if timeout_cnt >= 10:
                 raise ValueError("Connection error, check the internet")
@@ -146,6 +287,7 @@ class ClientRobot:
         img_scene = env_obs["scene"]
         img_hand_left = env_obs["wrist"]
         img_hand_right = env_obs["rgb"]
+        depth = env_obs["depth"]
 
         img_scene = Image.fromarray(img_scene)
         resized_scene = img_scene.resize(target_img_size)
@@ -153,32 +295,27 @@ class ClientRobot:
         resized_hand_left = img_hand_left.resize(target_img_size)
         img_hand_right = Image.fromarray(img_hand_right)
         resized_hand_right = img_hand_right.resize(target_img_size)
+        depth = Image.fromarray(depth, mode="L")
+        resized_depth = depth.resize(target_img_size)
         
         env_obs = {
             "img_scene": np.array(resized_scene),
             "img_hand_left": np.array(resized_hand_left),
             "img_hand_right": np.array(resized_hand_right),
+            "depth": np.array(resized_depth),
         }
         return env_obs
 
-    def roll_out(self, instruction, roll_out_len=200):
+    def roll_out(self,  roll_out_len=200):
         for idx in range(roll_out_len):
-            env_obs = self.env_update()
-            env_obs = self.get_input_obs(env_obs)
-            action = self.step(env_obs, instruction)
-            action = [np.array(action)]            
-            if isinstance(action, list):
-                for step_action in action:
-                    
-                    # this line is only for relative action, when you get absolute action, comment this line                    
-                    step_action = self.rel2abs(step_action, self.robot.get_state())
-                    self.robot.send_action(step_action)
-                    time.sleep(0.1)
-            elif isinstance(action, np.ndarray):
-                self.robot.send_action(action)
+            if self.action_buffer.empty():
                 time.sleep(0.1)
-            else:
-                raise TypeError("actions must be list or ndarray")
+                # print("Action buffer is empty, waiting...")
+                continue
+            step_action = self.action_buffer.get()                 
+            step_action = self.rel2abs(step_action, self.robot.get_state())
+            print(f"Step {idx+1}/{roll_out_len}, Action: {step_action}")
+            self.robot.send_action(step_action)
     
     def roll_out_test(self):
         ### this func just for dummy test
@@ -221,8 +358,12 @@ def infer(cfg: InferConfig):
 
     for instruction in cfg.language_instructions:
         print(f"Executing instruction: {instruction}")
+        robot.instruction = instruction
         robot.reset()
-        robot.roll_out(instruction)
+        if not robot.thread_running:
+            robot.thread_running = True
+            robot.thread_get_action_loop.start()
+        robot.roll_out()
 
 
 if __name__ == "__main__":

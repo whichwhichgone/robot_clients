@@ -26,7 +26,7 @@ from arm_robot import ArmRobot
 
 @dataclass
 class InferConfig:
-    server_url: str = "http://172.16.78.10:35189/predict"
+    server_url: str = "http://172.16.78.10:36556/predict"
     debug_mode: bool = True
     debug_dir: str = Path("/home/robot/workspace/ManiStation/UR5_cogact/imgs_debug")
 
@@ -46,7 +46,10 @@ class InferConfig:
     )
 
     # language instructions
-    language_instructions = ["grasp and lift the corn",]
+    # language_instructions = ["put the corn in the blue bowl",]
+    # language_instructions = ["move the white cube into a blue bowl",]
+    language_instructions = ["get the cube and put it into the red bowl",]
+    # language_instructions = ["grasp corn into the red bowl",]
 
 
 class ClientRobot:
@@ -112,12 +115,11 @@ class ClientRobot:
         # compose the request payload
         # self.robot.get_state()
         state = self.robot.get_state()
-        payload = {"instruction": language_instruction, "state": state.tolist()}
+        payload = {"instruction": language_instruction, "subtask_instruction_type":"mmins"}   # mmins, goal_image, imitation_video, ins_image 
         files = {
             "json": json.dumps(payload),
-            "img_scene": ("img_scene.txt", img_scene_data, "text/plain"),
-            "img_hand_left": ("img_hand_left.txt", img_hand_left_data, "text/plain"),
-            "img_hand_right": ("img_hand_right.txt", img_hand_right_data, "text/plain"),
+            "img_static": ("img_stat.txt", img_hand_right_data, "text/plain"),
+            "img_gripper": ("img_grip.txt", img_hand_left_data, "text/plain"),
         }
 
         timeout_cnt = 0
@@ -137,11 +139,14 @@ class ClientRobot:
             if timeout_cnt >= 10:
                 raise ValueError("Connection error, check the internet")
 
-        action = [np.array(elem) for elem in action]
-        return action
+        resp_action = np.array(action)
+        action_set = np.array_split(resp_action, 10)
+        for elem in action_set:
+            elem[-1] = 1.0 if elem[-1] > 0.2 else 0.0 
+        return action_set
 
 
-    def get_input_obs(self, env_obs, target_img_size=(224, 224)):
+    def get_input_obs(self, env_obs, target_img_size=(640, 480)):
         # covert the original obs to the target format for model.
         img_scene = env_obs["scene"]
         img_hand_left = env_obs["wrist"]
@@ -166,7 +171,6 @@ class ClientRobot:
             env_obs = self.env_update()
             env_obs = self.get_input_obs(env_obs)
             action = self.step(env_obs, instruction)
-            action = [np.array(action)]            
             if isinstance(action, list):
                 for step_action in action:
                     

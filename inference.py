@@ -26,7 +26,7 @@ from arm_robot import ArmRobot
 
 @dataclass
 class InferConfig:
-    server_url: str = "http://172.16.78.10:35189/predict"
+    server_url: str = "http://172.16.78.10:35001/predict"
     debug_mode: bool = True
     debug_dir: str = Path("/home/robot/workspace/ManiStation/UR5_cogact/imgs_debug")
 
@@ -46,7 +46,7 @@ class InferConfig:
     )
 
     # language instructions
-    language_instructions = ["put the yellow corn into the red bowl.",]
+    language_instructions = ["pick up the corn and put it into the red bowl",]
 
 
 class ClientRobot:
@@ -95,11 +95,13 @@ class ClientRobot:
         img_scene = obs["img_scene"]
         img_hand_left = obs["img_hand_left"]
         img_hand_right = obs["img_hand_right"]
+        depth = obs["depth"]
 
         # convert to bytes for sending
         img_scene_data = img_scene.tobytes()
         img_hand_left_data = img_hand_left.tobytes()
         img_hand_right_data = img_hand_right.tobytes()
+        depth_data = depth.astype(np.float32).tobytes()
 
         if self.debug:
             img_scene = Image.fromarray(img_scene)
@@ -118,6 +120,7 @@ class ClientRobot:
             "img_scene": ("img_scene.txt", img_scene_data, "text/plain"),
             "img_hand_left": ("img_hand_left.txt", img_hand_left_data, "text/plain"),
             "img_hand_right": ("img_hand_right.txt", img_hand_right_data, "text/plain"),
+            "depth": ("depth.txt", depth_data, "text/plain"),
         }
 
         timeout_cnt = 0
@@ -132,7 +135,7 @@ class ClientRobot:
                     print("Error return code, retry")
             except requests.RequestException:
                 print("Error request sending, retry")
-            time.sleep(0.5)
+            #time.sleep(0.5)
             timeout_cnt += 1
             if timeout_cnt >= 10:
                 raise ValueError("Connection error, check the internet")
@@ -146,6 +149,7 @@ class ClientRobot:
         img_scene = env_obs["scene"]
         img_hand_left = env_obs["wrist"]
         img_hand_right = env_obs["rgb"]
+        depth = env_obs["depth"]
 
         img_scene = Image.fromarray(img_scene)
         resized_scene = img_scene.resize(target_img_size)
@@ -153,11 +157,14 @@ class ClientRobot:
         resized_hand_left = img_hand_left.resize(target_img_size)
         img_hand_right = Image.fromarray(img_hand_right)
         resized_hand_right = img_hand_right.resize(target_img_size)
+        depth = Image.fromarray(depth, mode="L")
+        resized_depth = depth.resize(target_img_size)
         
         env_obs = {
             "img_scene": np.array(resized_scene),
             "img_hand_left": np.array(resized_hand_left),
             "img_hand_right": np.array(resized_hand_right),
+            "depth": np.array(resized_depth),
         }
         return env_obs
 
@@ -172,10 +179,10 @@ class ClientRobot:
                     # this line is only for relative action, when you get absolute action, comment this line                    
                     step_action = self.rel2abs(step_action, self.robot.get_state())
                     self.robot.send_action(step_action)
-                    time.sleep(0.1)
+                    #time.sleep(0.1)
             elif isinstance(action, np.ndarray):
                 self.robot.send_action(action)
-                time.sleep(0.1)
+                #time.sleep(0.1)
             else:
                 raise TypeError("actions must be list or ndarray")
     
@@ -187,7 +194,7 @@ class ClientRobot:
         for step_action in action:
             #step_action = self.rel2abs(step_action, self.robot.get_state())
             self.robot.send_action(step_action)
-            time.sleep(0.1)
+            time.sleep(0.01)
     
     def rel2abs(self, rel_action, curr_state):
         assert curr_state.shape[0] == 8, "wrong format robot state"
