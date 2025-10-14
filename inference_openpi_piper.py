@@ -11,7 +11,7 @@ sys.path.append(
     "/home/xhjqr/gello_ws/agilex_agent_env_py/gello_arm_python/wl_ros2_ws/src/wl_robot_python_sdk/wl_robot_python_sdk"
 )
 
-# NOTE: Need to initialize the env with init_env.sh before running this script 
+# NOTE: Need to initialize the env with init_env_piper.sh before running this script 
 from motor_controller import ArmController
 from utils.high_freq_timer import HighFreqTimer
 from utils.cameras import ThreadedVideoCapture
