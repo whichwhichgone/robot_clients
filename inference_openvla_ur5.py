@@ -71,8 +71,8 @@ class ClientRobot:
         env_obs = {
             "depth": depth_img,                                         # shape (540, 960),    np.float32
             "rgb": rgb_image,                                           # shape (540, 960, 3), np.uint8
-            "scene": scene_image,                                   # shape (480, 640, 3), np.uint8
-            "wrist": wrist_image,                                   # shape (480, 640, 3), np.unit8
+            "scene": scene_image,                                       # shape (480, 640, 3), np.uint8
+            "wrist": wrist_image,                                       # shape (480, 640, 3), np.unit8
             "state": robot_state,                                       # shape (8,)           np.float64
         }
 
