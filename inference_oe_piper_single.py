@@ -15,11 +15,12 @@ sys.path.append(
 from motor_controller import ArmController
 from utils.high_freq_timer import HighFreqTimer
 from utils.cameras import ThreadedVideoCapture
+import re
 
 
 @dataclass
 class InferConfig:
-    server_url: str = "http://172.16.78.10:32618/predict"
+    server_url: str = "http://172.16.78.10:37690/predict"
     debug_mode: bool = True
     debug_dir: str = Path("./imgs_debug")
 
@@ -45,10 +46,11 @@ class InferConfig:
 
     # language instructions
     language_instructions = [
-        #"Please make a scented bag",
-        "Place the white herbal pouch into the yellow sachet.",
-        # "Place the red herbal pouch into the blue sachet.",
+        "<goal_image_1_1>",
+        #"pick up the <corn_1> and put it into the <red_bowl_1>",
+        #"arrange the blocks on the table into an L-shape",
     ]
+    instruction_type = "goal_image"
 
 
 class ClientRobot:
@@ -64,6 +66,7 @@ class ClientRobot:
         self.action = np.array(cfg.init_action)
         self.timer = HighFreqTimer(0.01, lambda: self.callback_action(self.action))
         self.timer.start()
+        self.instruction_type = cfg.instruction_type
 
         self.server_url = cfg.server_url
         self.debug = cfg.debug_mode
@@ -178,17 +181,25 @@ class ClientRobot:
 
         # compose the request payload
         payload = {"instruction": language_instruction, "state": state.tolist()}
+        subtask_instruction_type = {
+            "instruction_type": self.instruction_type, 
+            "object_aspect_ratio": None,                  # this field is not used
+            }
+
         files = {
             "json": json.dumps(payload),
-            "img_scene": ("img_scene.txt", img_scene_data, "text/plain"),
-            "img_hand_left": ("img_hand_left.txt", img_hand_left_data, "text/plain"),
-            "img_hand_right": ("img_hand_right.txt", img_hand_right_data, "text/plain"),
+            "subtask_instruction_type": json.dumps(subtask_instruction_type),
+            "img_static": ("img_scene.txt", img_scene_data, "text/plain"),
+            "img_gripper": ("img_hand_right.txt", img_hand_right_data, "text/plain"),
         }
+
+        # compose the open-ended request according to the instruction type
+        updated_files = self.compose_oe_request(files, language_instruction)
 
         timeout_cnt = 0
         while True:
             try:
-                action = requests.post(self.server_url, files=files)
+                action = requests.post(self.server_url, files=updated_files)
                 if action.status_code == 200:
                     action = action.json()
                     break
@@ -202,8 +213,8 @@ class ClientRobot:
                 raise ValueError("Connection error, check the internet")
 
         resp_action = np.array(action)
-        action = np.array_split(resp_action, 50)
-        action = action[:16]
+        action = np.array_split(resp_action, 16)
+        #action = action[:20]
         return action
 
     def get_input_obs(self, env_obs, target_img_size=(224, 224)):
@@ -216,20 +227,20 @@ class ClientRobot:
         img_scene = Image.fromarray(img_scene)
         width, height = img_scene.size
         max_side = max(width, height)
-        resized_scene = ImageOps.pad(img_scene, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_scene = resized_scene.resize(target_img_size, Image.BICUBIC)
+        # resized_scene = ImageOps.pad(img_scene, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_scene = img_scene.resize(target_img_size, Image.BICUBIC)
 
         img_hand_left = Image.fromarray(img_hand_left)
         width, height = img_hand_left.size
         max_side = max(width, height)
-        resized_hand_left = ImageOps.pad(img_hand_left, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_hand_left = resized_hand_left.resize(target_img_size, Image.BICUBIC)
+        # resized_hand_left = ImageOps.pad(img_hand_left, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_hand_left = img_hand_left.resize(target_img_size, Image.BICUBIC)
 
         img_hand_right = Image.fromarray(img_hand_right)
         width, height = img_hand_right.size
         max_side = max(width, height)
-        resized_hand_right = ImageOps.pad(img_hand_right, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_hand_right = resized_hand_right.resize(target_img_size, Image.BICUBIC)
+        # resized_hand_right = ImageOps.pad(img_hand_right, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_hand_right = img_hand_right.resize(target_img_size, Image.BICUBIC)
 
         env_obs = {
             "img_scene": np.array(resized_scene),
@@ -239,14 +250,23 @@ class ClientRobot:
         }
         return env_obs
 
-    def roll_out(self, instruction, roll_out_len=1000):
+    def roll_out(self, instruction, roll_out_len=200):
         for idx in range(roll_out_len):
             env_obs = self.env_update()
             env_obs = self.get_input_obs(env_obs)
             action = self.step(env_obs, instruction)
+            left_action = np.array(
+                [0.02147573103039857,
+                -0.19021361769781908,
+                -0.21629129109187506,
+                -0.003067961575771161,
+                0.9802137234589248,
+                0.05829126993965428,
+                1.0])
             if isinstance(action, list):
                 for step_action in action:
                     time.sleep(0.05)
+                    step_action = np.concatenate([left_action, step_action], axis=0)
                     self.send_action(step_action)
             else:
                 raise TypeError("actions must be list of ndarray, each with shape (14,)")
@@ -257,9 +277,65 @@ class ClientRobot:
             action = json.load(f)
         action = [elem["joint"] for elem in action]
 
+        cnt = 0
         for step_action in action:
             self.send_action(step_action)
             time.sleep(0.05)
+            cnt += 1
+            if cnt % 20 == 0:
+                time.sleep(2)
+    
+
+    def compose_oe_request(self, files, language_instruction):
+        if self.instruction_type == "mmins":
+            matches = re.findall(r"<(.*?)>", language_instruction)
+            assert matches, "No object specified in the instruction"            
+            obj_img_size = {}
+            for item in matches:
+                obj_name = f"obj_{item.replace(' ', '_')}"
+                obj_path = Path(f"./oe_utils/{item.replace(' ', '_')}.png")
+                obj_image = np.array(Image.open(obj_path).convert("RGB"))
+                obj_image_data = obj_image.tobytes()
+                obj_img_size[obj_name] = obj_image.shape
+                files[obj_name] = (f"{obj_name}.txt", obj_image_data, "text/plain")
+            files["obj_image_size"] = json.dumps(obj_img_size)
+
+        elif self.instruction_type == "goal_image":
+            matches = re.findall(r"<(.*?)>", language_instruction)
+            assert matches and len(matches) == 1, "No goal image specified in the instruction"
+            goal_name = matches[0].replace(" ", "_")
+            goal_path = Path(f"./oe_utils/{goal_name}.png")
+            goal_image = np.array(Image.open(goal_path).convert("RGB").resize((224, 224), Image.BICUBIC))
+            goal_image_data = goal_image.tobytes()
+            files["goal_image_static"] = ("goal_image_static.txt", goal_image_data, "text/plain")
+
+        elif self.instruction_type == "imitation_video":
+            matches = re.findall(r"<(.*?)>", language_instruction)
+            assert matches and len(matches) == 1, "No demo video specified in the instruction"
+            video_name = matches[0].replace(" ", "_")
+            video_frames = []
+            for idx in range(1, 5):
+                frame_path = Path(f"./oe_utils/{video_name}_frame{idx}.png")
+                frame_image = np.array(Image.open(frame_path).convert("RGB").resize((224, 224), Image.BICUBIC))
+                video_frames.append(frame_image)
+            video_frames_data = np.array(video_frames).tobytes()
+            files["imitation_video_static"] = ("imitation_video_static.txt", video_frames_data, "text/plain")
+            
+        elif self.instruction_type == "ins_image":
+            matches = re.findall(r"<(.*?)>", language_instruction)
+            assert matches and len(matches) == 1, "No instruction image specified in the instruction"
+            ins_name = matches[0].replace(" ", "_")
+            ins_path = Path(f"./oe_utils/{ins_name}.png")
+            ins_image = np.array(Image.open(ins_path).convert("RGB"))
+            ins_image_data = ins_image.tobytes()
+            files["ins_image"] = ("ins_image.txt", ins_image_data, "text/plain")
+        elif self.instruction_type == "text":
+            pass
+        else:
+            raise ValueError(f"Unknown instruction type: {self.instruction_type}")
+
+        return files
+
 
 
 @draccus.wrap()
@@ -268,7 +344,6 @@ def infer(cfg: InferConfig):
 
     for instruction in cfg.language_instructions:
         print(f"Executing instruction: {instruction}")
-        ready = input("press any key if you are ready:")
         robot.roll_out(instruction)
         #robot.roll_out_test()
 

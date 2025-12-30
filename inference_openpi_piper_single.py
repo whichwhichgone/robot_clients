@@ -19,7 +19,7 @@ from utils.cameras import ThreadedVideoCapture
 
 @dataclass
 class InferConfig:
-    server_url: str = "http://172.16.78.10:32618/predict"
+    server_url: str = "http://172.16.78.10:32739/predict"
     debug_mode: bool = True
     debug_dir: str = Path("./imgs_debug")
 
@@ -45,9 +45,8 @@ class InferConfig:
 
     # language instructions
     language_instructions = [
-        #"Please make a scented bag",
-        "Place the white herbal pouch into the yellow sachet.",
-        # "Place the red herbal pouch into the blue sachet.",
+        "pick up the left corn and put it into the red bowl",
+        #"arrange the blocks on the table into an L-shape, first put blue at bottom, second put red at top, last put yellow at right",
     ]
 
 
@@ -202,8 +201,8 @@ class ClientRobot:
                 raise ValueError("Connection error, check the internet")
 
         resp_action = np.array(action)
-        action = np.array_split(resp_action, 50)
-        action = action[:16]
+        action = np.array_split(resp_action, 16)
+        #action = action[:20]
         return action
 
     def get_input_obs(self, env_obs, target_img_size=(224, 224)):
@@ -216,20 +215,20 @@ class ClientRobot:
         img_scene = Image.fromarray(img_scene)
         width, height = img_scene.size
         max_side = max(width, height)
-        resized_scene = ImageOps.pad(img_scene, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_scene = resized_scene.resize(target_img_size, Image.BICUBIC)
+        # resized_scene = ImageOps.pad(img_scene, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_scene = img_scene.resize(target_img_size, Image.BICUBIC)
 
         img_hand_left = Image.fromarray(img_hand_left)
         width, height = img_hand_left.size
         max_side = max(width, height)
-        resized_hand_left = ImageOps.pad(img_hand_left, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_hand_left = resized_hand_left.resize(target_img_size, Image.BICUBIC)
+        # resized_hand_left = ImageOps.pad(img_hand_left, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_hand_left = img_hand_left.resize(target_img_size, Image.BICUBIC)
 
         img_hand_right = Image.fromarray(img_hand_right)
         width, height = img_hand_right.size
         max_side = max(width, height)
-        resized_hand_right = ImageOps.pad(img_hand_right, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
-        resized_hand_right = resized_hand_right.resize(target_img_size, Image.BICUBIC)
+        # resized_hand_right = ImageOps.pad(img_hand_right, (max_side, max_side), method=Image.LANCZOS, color=(0, 0, 0))
+        resized_hand_right = img_hand_right.resize(target_img_size, Image.BICUBIC)
 
         env_obs = {
             "img_scene": np.array(resized_scene),
@@ -239,14 +238,24 @@ class ClientRobot:
         }
         return env_obs
 
-    def roll_out(self, instruction, roll_out_len=1000):
+    def roll_out(self, instruction, roll_out_len=200):
         for idx in range(roll_out_len):
             env_obs = self.env_update()
             env_obs = self.get_input_obs(env_obs)
             action = self.step(env_obs, instruction)
+            left_action = np.array(
+                [0.02147573103039857,
+                -0.19021361769781908,
+                -0.21629129109187506,
+                -0.003067961575771161,
+                0.9802137234589248,
+                0.05829126993965428,
+                1.0])
             if isinstance(action, list):
                 for step_action in action:
                     time.sleep(0.05)
+                    step_action[6] -= 0.1
+                    step_action = np.concatenate([left_action, step_action], axis=0)
                     self.send_action(step_action)
             else:
                 raise TypeError("actions must be list of ndarray, each with shape (14,)")
@@ -257,9 +266,13 @@ class ClientRobot:
             action = json.load(f)
         action = [elem["joint"] for elem in action]
 
+        cnt = 0
         for step_action in action:
             self.send_action(step_action)
             time.sleep(0.05)
+            cnt += 1
+            if cnt % 20 == 0:
+                time.sleep(2)
 
 
 @draccus.wrap()
@@ -268,7 +281,6 @@ def infer(cfg: InferConfig):
 
     for instruction in cfg.language_instructions:
         print(f"Executing instruction: {instruction}")
-        ready = input("press any key if you are ready:")
         robot.roll_out(instruction)
         #robot.roll_out_test()
 
